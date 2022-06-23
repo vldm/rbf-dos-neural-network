@@ -1,4 +1,4 @@
-use std::{fs::File, env, path::{PathBuf, Path}, io::{BufReader, BufRead}, collections::{HashSet, HashMap}, borrow::{Cow, Borrow}, process::exit};
+use std::{fs::File, env, path::{PathBuf, Path, Iter}, io::{BufReader, BufRead, BufWriter}, collections::{HashSet, HashMap, BTreeMap}, borrow::{Cow, Borrow}, process::exit, mem::transmute_copy, time::Instant};
 
 use nalgebra::{DVector, DMatrix};
 
@@ -10,9 +10,12 @@ use log::*;
 pub mod kdd_schema;
 
 use kdd_schema::{KDDRecordWithLable, KDDRecord};
-use flate2::read::GzDecoder;
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use serde::{Serialize, Deserialize};
 
-#[derive(Clone)]
+use crate::kdd_schema::Label;
+
+#[derive(Clone, Serialize, Deserialize)]
 struct RBFNetwork {
     //
     // Hidden layer
@@ -304,7 +307,12 @@ impl RBFNetwork {
         info!("Accuracy: {}", accuracy);
     }
     fn max_predict_index(result: DVector<f64>) -> Option<usize> {
-        result.row_iter().enumerate().max_by(|(_, i1),(_, i2)|i1.x.partial_cmp(&i2.x).unwrap_or(std::cmp::Ordering::Equal)).map(|v|v.0)
+        result.row_iter()
+            .enumerate()
+            .max_by(|(_, i1),(_, i2)|
+                i1.x.partial_cmp(&i2.x)
+                    .unwrap_or(std::cmp::Ordering::Equal))
+            .map(|v|v.0)
     }
 
     // Gaussian function that we used as radial basis in our neural network
@@ -425,7 +433,7 @@ fn execute(
     num_networks: u64,
     hidden_neurons: usize,
     max_epochs: usize,
-) {
+) -> RBFNetwork {
     let mut best_network = None;
     for seed in start_seed..(start_seed + num_networks) {
         let data_elem = test_data.first().unwrap();
@@ -461,6 +469,7 @@ fn execute(
 
     info!("Statistic on full set:");
     best_network.network.print_statis(&test_data);
+    best_network.network
 }
 
 
@@ -489,35 +498,68 @@ enum Args {
         epochs_stats: bool, // TODO
 
 
-        // #[clap(long= "file")]
-        // file: String,
+        #[clap(long= "file")]
+        file: String,
+        model: String,
     },
     Verify {
-        #[clap(long= "num-epochs")]
-        /// How many iterations per networks should we process
-        max_epochs: usize,
 
-        #[clap(long= "hidden-neurons")]
-        hidden_neurons: usize,
-
-        #[clap(long= "seed")]
-        seed: u64,
+        #[clap(long= "model")]
+        model: String,
 
         #[clap(long= "file")]
         file: String,
     },
-    // /// Give information about file
-    // Stats {
+    CheckEntry {
 
-    //     #[clap(long= "file")]
-    //     file: String,
-    // },
+        #[clap(long= "model")]
+        model: String,
+        data: String,
+    },
+    /// Give information about file
+    SampleInfo {
+        file: String,
+    },
 
-    // Take {
+    // Collect balanced sample.
+    // For each cluster it should provide same amount of entries. 
+    SampleTake {
+        // How many of items should we have in each cluster.
+        // Make sure that this limit is set based on `sample-stats` command,
+        // and we have enough entries for each cluster.
+        #[clap(long= "limit")]
+        limit: usize,
+        // How much of samples we should skip.
+        #[clap(long= "skip", default_value_t=0)]
+        skip: usize,
+        #[clap(long= "file")]
+        file: String,
 
-    //     #[clap(long= "file")]
-    //     file: String,
-    // }
+        #[clap(long= "output")]
+        output: String,
+
+        #[clap(long= "filter-max-index")]
+        filter_max: bool,
+    },
+
+    /// Shuffle file
+    Shuffle {
+        source: String,
+        destination: String,
+
+        #[clap(long= "seed")]
+        seed: Option<u64>,
+    },
+    FindOptimal {
+        #[clap(long= "train-data")]
+        train_data: String,
+
+        #[clap(long= "verify-data")]
+        verify_data: String,
+
+        #[clap(long= "output")]
+        output: String,
+    }
 
 }
 
@@ -539,6 +581,20 @@ impl KDDSchemaReader {
         record_raw.deserialize(
             None, // Names in KDDRecord are same
         ).map_err(From::from)
+    }
+    pub fn save_sample<'b>(file: &Path, data: impl IntoIterator<Item = &'b KDDRecordWithLable>) -> Result<(), anyhow::Error> {
+        let kdd_file = File::create(&file)?;
+
+        let encoder = GzEncoder::new(kdd_file, Compression::best());
+        let mut writer = csv::WriterBuilder::new()
+                            .has_headers(false)
+                            .quote_style(csv::QuoteStyle::Never)
+                            .terminator(csv::Terminator::Any(b'\n'))
+                            .from_writer(encoder);
+        for d in data {
+            writer.serialize(d)?;
+        }
+        Ok(())
     }
 
     pub fn test_data(file: &Path) -> Result<(Vec<(DVector<f64>, DVector<f64>)>, Vec<KDDRecordWithLable>), anyhow::Error> {
@@ -574,56 +630,24 @@ fn main() -> Result<(), anyhow::Error> {
             num_networks,
             start_seed,
             hidden_neurons,
-            epochs_stats: _epochs_stats
+            file,
+            model,
+            epochs_stats: _epochs_stats,
         } => {
-            const KDD_TRAIN_DATA: &str = "data/kddcup.data_10_percent.gz";
-
-            let project_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-            let kdd_data_path = PathBuf::from(project_dir).join(KDD_TRAIN_DATA);
-
-            let test_data_vectored = KDDSchemaReader::test_data(&kdd_data_path)?;
-            execute(test_data_vectored.0,
+            let test_data_vectored = KDDSchemaReader::test_data(&PathBuf::from(file))?;
+            let network = execute(test_data_vectored.0,
             start_seed,
             num_networks,
             hidden_neurons,
-            max_epochs)
+            max_epochs);
+            let file = File::create(model)?;
+            serde_json::to_writer(file, &network)?
         }
         Args::Verify { 
-            seed,
-            max_epochs,
-            hidden_neurons,
-            file
+            file,
+            model,
         } => {
-            const KDD_TRAIN_DATA: &str = "data/kddcup.data_10_percent.gz";
-
-            let project_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-            let kdd_data_path = PathBuf::from(project_dir).join(KDD_TRAIN_DATA);
-
-            let (test_data,_) = KDDSchemaReader::test_data(&kdd_data_path)?;
-
-            // Recover network 
-
-            let data_elem = test_data.first().unwrap();
-            let num_outputs = data_elem.1.nrows();
-            let input_neurons = data_elem.0.nrows();
-            
-            // let seed = 11;
-            let mut generator = rand::rngs::StdRng::seed_from_u64(seed);
-            info!("Creating a {}-{}-{} RBF network, seed = {}", input_neurons, hidden_neurons, num_outputs,  seed);
-            let sigma = 0.1;
-            info!("Setting LR = {}, max_epochs = {}, sigma = {}", LR, max_epochs, sigma);
-            info!("Starting training");
-            let mut network = RBFNetwork::new( &mut generator, hidden_neurons, &test_data, sigma);
-        
-            let mut current_best = 
-            BestNetwork {
-                seed,
-                epoch: 0,
-                accuracy: 0.,
-                network: network.clone()
-            };
-            network.train(&mut generator, max_epochs, test_data.clone(), &mut current_best, seed);
-        
+            let network: RBFNetwork = serde_json::from_reader(File::open(model)?)?;
            
             let kdd_data_path = PathBuf::from(file);
 
@@ -631,6 +655,110 @@ fn main() -> Result<(), anyhow::Error> {
 
             info!("Statistic on full set:");
             print_statis_custom(&network, &verify_data.0);
+        }
+        Args::SampleInfo {
+            file,   
+        } => {
+            let test_data = KDDSchemaReader::test_data(&PathBuf::from(file))?;
+
+            let max_idx = test_data.0.first().unwrap().1.nrows() - 1;
+            let mut clusters_counter: BTreeMap<u32, (usize, i32)> = BTreeMap::new();
+            for record in test_data.1 {
+                clusters_counter.entry(record.label.into()).or_insert_with(|| {
+                    let cluster_index = RBFNetwork::max_predict_index(record.output_vector()).unwrap();
+                    (cluster_index, 0)
+                }).1 += 1;
+            }
+            println!("Num clusters: {}", clusters_counter.len());
+            
+            for (cluster, (idx, len)) in &clusters_counter {
+                let cluster_label: Label = (*cluster).try_into().unwrap();
+                println!("Cluster[{}], type_name: {:?}, num_entries: {}", idx, cluster_label, len);
+            }
+
+            let (min_cluster, (idx, min_count)) = clusters_counter.iter().min_by_key(|c|c.1.1).unwrap();
+
+            let cluster_label: Label = (*min_cluster).try_into().unwrap();
+            println!("Minumum cluster [{}], type_name: {:?}, num_entries: {}", idx, cluster_label, min_count);
+
+
+            let (min_cluster, (idx, min_count)) = clusters_counter.iter().filter(|e|e.1.0 != max_idx ).min_by_key(|c|c.1.1).unwrap();
+
+            let cluster_label: Label = (*min_cluster).try_into().unwrap();
+            println!("Minimum cluster from output_vector [{}], type_name: {:?}, num_entries: {}", idx, cluster_label, min_count);
+        }
+        Args::SampleTake {
+            limit,
+            skip,
+            file,
+            output,
+            filter_max
+        } => {
+            let test_data = KDDSchemaReader::test_data(&PathBuf::from(file))?;
+            
+            // Get any data.
+            // And take len of output vector.
+            // This is needed to avoid hardcodings.
+            let mut num_clusters = test_data.0.first().unwrap().1.nrows();
+            
+            let clusters_collector: BTreeMap<usize, Vec<_>> = 
+            test_data.1.into_iter().fold( BTreeMap::new(), |mut clusters_collector, e|{
+                let cluster_index = RBFNetwork::max_predict_index(e.output_vector()).unwrap();
+                clusters_collector.entry(cluster_index).or_insert(Default::default()).push(e);
+                clusters_collector
+            });
+
+            // if flag set - don't collect garbage clusters
+            if filter_max {
+                num_clusters -=1;
+            } 
+
+            let mut iters = Vec::new();
+            for idx in 0..num_clusters {
+                let cluster = clusters_collector.get(&idx).unwrap();
+                iters.push(cluster.iter())
+            }
+            let mut full_data = Vec::new();
+
+            for i in 0..(skip + limit) {
+                let mut elems = Vec::new();
+                for cluster_iter in &mut iters {
+                    let elem = cluster_iter.next().expect("No enough items");
+                    elems.push(elem)
+                }
+                if i < skip {
+                    continue;
+                }
+                // make it plain
+                full_data.extend_from_slice(&elems)
+            }
+
+            KDDSchemaReader::save_sample(&PathBuf::from(output), full_data)?;
+            
+        }
+        Args::Shuffle { source, destination, seed } => {
+            let mut test_data = KDDSchemaReader::test_data(&PathBuf::from(source))?;
+            
+            let mut generator = rand::rngs::StdRng::seed_from_u64(seed.unwrap_or_else(||rand::thread_rng().gen()));
+            test_data.1.shuffle(&mut generator);
+            
+            KDDSchemaReader::save_sample(&PathBuf::from(destination), &test_data.1)?;
+        }
+        Args::CheckEntry { 
+            model,
+            data
+        } => {
+            let network: RBFNetwork = serde_json::from_reader(File::open(model)?)?;
+            info!("Input = {}",data);
+            let test_entry = KDDSchemaReader::parse_line(&data)?;
+            info!("Output = {}", network.compute_outputs(test_entry.input_vector(), false));
+        }
+        Args::FindOptimal { train_data, verify_data, output } => {
+            
+            let mut train_data = KDDSchemaReader::test_data(&PathBuf::from(train_data))?;
+
+            let mut test_data = KDDSchemaReader::test_data(&PathBuf::from(verify_data))?;
+            find_optimal(train_data.0, test_data.0, output)?
         }
         _ => todo!()
     }
@@ -641,16 +769,15 @@ fn main() -> Result<(), anyhow::Error> {
 }
 
 
-fn statis_custom(network: &RBFNetwork, data: &[(DVector<f64>, DVector<f64>)], debug: bool) -> (f64, f64, f64, f64, f64) {
+fn statis_custom(network: &RBFNetwork, data: &[(DVector<f64>, DVector<f64>)], debug: bool) -> (f64, f64, DVector<f64>, DVector<f64>) {
     let mut sum_se = 0.;
     let mut nc = 0.;
     let mut nw = 0.;
 
-    let  (mut not_ddos_catches, mut not_ddos_total) = (0., 0.);
+    
+    let mut catch_per_cluster = data.first().unwrap().1.map(|_|0.);
+    let mut miss_per_cluster = data.first().unwrap().1.map(|_|0.);
 
-    let  (mut ddos_catches, mut ddos_total) = (0., 0.);
-
-    let  (mut ddos_in_data, mut ddos_miss_in_data) = (0., 0.);
     for (coords, results) in data {
         let outputs = network.compute_outputs(coords.clone(), debug);
 
@@ -674,47 +801,149 @@ fn statis_custom(network: &RBFNetwork, data: &[(DVector<f64>, DVector<f64>)], de
         let idx = RBFNetwork::max_predict_index(outputs).unwrap();
         if results[idx] == 1. {
             nc += 1.;
+            catch_per_cluster[idx] += 1.
         } else {
             nw += 1.;
-        }
-
-        // count ddos statistic based on last index
-        let not_ddos_idx = results.nrows() - 1;
-        if results[not_ddos_idx] == 1. {
-            not_ddos_total+= 1.;
-            if idx == not_ddos_idx {
-                not_ddos_catches += 1.;
-            }
-        } else {
-            ddos_total  += 1.;
-            if idx != not_ddos_idx {
-                ddos_catches += 1.;
-            }
-        }
-
-        if results[not_ddos_idx] == 1. {
-            ddos_miss_in_data += 1.;
-        } else {
-            ddos_in_data += 1.;
+            miss_per_cluster[idx] += 1.
         }
 
     }
     let accuracy = (nc * 1.0) / (nc + nw);
-    let ddos_accuracy = (ddos_catches * 1.0) / (ddos_total);
-
-    let not_ddos_accuracy = (not_ddos_catches * 1.0) / (not_ddos_total);
-
-    let ddos_in_data_rate = (ddos_in_data * 1.0) / (ddos_in_data + ddos_miss_in_data);
     let error = sum_se / data.len() as f64;
-    (accuracy, error, ddos_accuracy, not_ddos_accuracy, ddos_in_data_rate)
+    (accuracy, error, catch_per_cluster, miss_per_cluster)
     
 }
 
 fn print_statis_custom(network: &RBFNetwork, data: &[(DVector<f64>, DVector<f64>)]) {
-    let (accuracy, error, ddos_accuracy, not_ddos_accuracy, ddos_in_data_rate) = statis_custom(network, &data, false);
+    let (accuracy, error, catch_per_cluster, miss_per_cluster) = statis_custom(network, &data, false);
     info!("Error: {}", error);
     info!("Accuracy: {}", accuracy);
-    info!("Data statistic: {}", ddos_in_data_rate);
-    info!("False negative: {}", 1. - not_ddos_accuracy);
-    info!("False positive: {}", 1. - ddos_accuracy);
+
+    let default_vector = data.first().unwrap().1.map(|_|0.);
+    let count_of_outputs = data.iter().fold(default_vector, |count_of_outputs, (_, results)|{
+        count_of_outputs + results
+    });
+    KDDRecordWithLable::format_stats_per_cluster(&catch_per_cluster, &miss_per_cluster, &count_of_outputs);
+}
+
+fn find_optimal(train_data: Vec<(DVector<f64>, DVector<f64>)>, test_data: Vec<(DVector<f64>, DVector<f64>)>, output: String)-> Result<(), anyhow::Error> {
+
+    let epochs = (1..=10).into_iter();
+    let total_train_len = train_data.len();
+    // 20 is minimum because by default num neurons is equal to 20
+    let train_sizes = (20..4000).into_iter().step_by((4000-20) / 10);
+    let neurons_count = (1..=101).into_iter().step_by(10);
+    let num_networks = 10;
+
+    let start_seed = 777; // arbitrary num for luck
+
+    let file = File::create(output)?;
+    let mut csv_writer = csv::WriterBuilder::new()
+    .has_headers(true)
+    .quote_style(csv::QuoteStyle::Never)
+    .from_writer(BufWriter::new(file));
+    
+    // csv_writer.write_record(&[
+    //     "epoch",
+    //     "train_size",
+    //     "neurons_count",
+    //     "accuracy",
+    //     "error",
+    //     "duration"
+    // ])?;
+    let default_neurons = 20;
+    let default_max_epochs = 10;
+    let default_train_size = 100000;
+    {
+        for train_size in train_sizes {
+                let hidden_neurons = default_neurons;
+                let max_epochs = default_max_epochs;
+                let train_data = train_data[0..train_size].to_vec();
+                let network = execute(train_data,
+                start_seed,
+                num_networks,
+                hidden_neurons,
+                max_epochs);
+                
+                let time = Instant::now();
+                let (accuracy, error, catch_per_cluster, miss_per_cluster) = statis_custom(&network, &test_data, false);
+                
+                let duration_ms = time.elapsed().as_millis().try_into().unwrap();
+                let record = Record {
+                    epoch: max_epochs, train_size,
+                    neurons_count: hidden_neurons,
+                    accuracy,
+                    error,
+                    duration_ms
+                };
+                csv_writer.serialize(record)?;
+                csv_writer.flush()?;
+        }
+    }
+    {
+        let train_size = default_train_size;
+        let hidden_neurons = default_neurons;
+        for max_epochs in epochs.clone() {
+                let train_data = train_data[0..train_size].to_vec();
+                let network = execute(train_data,
+                start_seed,
+                num_networks,
+                hidden_neurons,
+                max_epochs);
+               
+                let time = Instant::now();
+                let (accuracy, error, catch_per_cluster, miss_per_cluster) = statis_custom(&network, &test_data, false);
+                
+                let duration_ms = time.elapsed().as_millis().try_into().unwrap();
+                let record = Record {
+                    epoch: max_epochs, train_size,
+                    neurons_count: hidden_neurons,
+                    accuracy,
+                    error,
+                    duration_ms
+                };
+
+                csv_writer.serialize(record)?;
+                csv_writer.flush()?;
+        }
+    }
+    {
+        let train_size = default_train_size;
+        let max_epochs = default_max_epochs;
+        for hidden_neurons in neurons_count.clone() {
+                let train_data = train_data[0..train_size].to_vec();
+                let network = execute(train_data,
+                start_seed,
+                num_networks,
+                hidden_neurons,
+                max_epochs);
+                let time = Instant::now();
+                let (accuracy, error, catch_per_cluster, miss_per_cluster) = statis_custom(&network, &test_data, false);
+                
+                let duration_ms = time.elapsed().as_millis().try_into().unwrap();
+                let record = Record {
+                    epoch: max_epochs, train_size,
+                    neurons_count: hidden_neurons,
+                    accuracy,
+                    error,
+                    duration_ms
+                };
+
+                csv_writer.serialize(record)?;
+                csv_writer.flush()?;
+        }
+    }
+    
+    Ok(())
+
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    epoch: usize,
+    train_size: usize,
+    neurons_count: usize,
+    accuracy: f64,
+    error: f64,
+    duration_ms: u64
 }

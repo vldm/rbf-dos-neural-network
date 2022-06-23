@@ -1,7 +1,9 @@
+use log::info;
 use nalgebra::DVector;
-use serde::Deserialize;
+use serde::{ Serialize, Deserialize};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KDDRecord {
     duration: u32,
     protocol_type: String,
@@ -82,10 +84,11 @@ impl KDDRecord {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(TryFromPrimitive, IntoPrimitive, Clone, Copy, Debug, Serialize,  Deserialize)]
 #[allow(non_camel_case_types)]
-enum Label {
-    back,
+#[repr(u32)]
+pub enum Label {
+    back = 0,
     buffer_overflow,
     ftp_write,
     guess_passwd,
@@ -135,10 +138,10 @@ enum Label {
         // warezclient r2l
         // warezmaster r2l
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KDDRecordWithLable {
     record: KDDRecord,
-    label: Label,
+    pub label: Label,
 }
 impl KDDRecordWithLable {
     pub fn is_dos(&self) -> bool {
@@ -149,12 +152,23 @@ impl KDDRecordWithLable {
             _ => false
         }
     }
-
-
    
     pub fn input_vector(&self) -> DVector<f64> {
         self.record.input_vector()
 
+    }
+
+    pub fn output_vector_to_label(idx: usize) -> Option<Label> {
+        Some(match idx {
+            0 => Label::back,
+            1 => Label::land,
+            2 => Label::neptune,
+            3 => Label::pod,
+            4 => Label::smurf,
+            5 => Label::teardrop,
+            6 => Label::normal,
+            _ => return None
+        })
     }
 
     pub fn output_vector(&self) -> DVector<f64> {
@@ -163,14 +177,54 @@ impl KDDRecordWithLable {
         // } else {
         //     0.
         // }])
+        // match self.label {
+        //     Label::back =>      DVector::from_row_slice(&[1., 0., 0., 0., 0., 0., 0.]),
+        //     Label::land =>      DVector::from_row_slice(&[0., 1., 0., 0., 0., 0., 0.]),
+        //     Label::neptune =>   DVector::from_row_slice(&[0., 0., 1., 0., 0., 0., 0.]),
+        //     Label::pod =>       DVector::from_row_slice(&[0., 0., 0., 1., 0., 0., 0.]),
+        //     Label::smurf =>     DVector::from_row_slice(&[0., 0., 0., 0., 1., 0., 0.]),
+        //     Label::teardrop =>  DVector::from_row_slice(&[0., 0., 0., 0., 0., 1., 0.]),
+        //     _ =>                DVector::from_row_slice(&[0., 0., 0., 0., 0., 0., 1.]),
+        // }
+
         match self.label {
-            Label::back =>      DVector::from_row_slice(&[1., 0., 0., 0., 0., 0., 0., 0.]),
-            Label::land =>      DVector::from_row_slice(&[0., 1., 0., 0., 0., 0., 0., 0.]),
-            Label::neptune =>   DVector::from_row_slice(&[0., 0., 1., 0., 0., 0., 0., 0.]),
-            Label::pod =>       DVector::from_row_slice(&[0., 0., 0., 0., 1., 0., 0., 0.]),
-            Label::smurf =>     DVector::from_row_slice(&[0., 0., 0., 0., 0., 1., 0., 0.]),
-            Label::teardrop =>  DVector::from_row_slice(&[0., 0., 0., 0., 0., 0., 1., 0.]),
-            _ =>                DVector::from_row_slice(&[0., 0., 0., 0., 0., 0., 0., 1.]),
+            // Label::neptune =>   DVector::from_row_slice(&[1., 0., 0., 0.]),
+            Label::smurf =>     DVector::from_row_slice(&[ 1., 0., 0.]),
+            Label::normal =>    DVector::from_row_slice(&[ 0., 1., 0.]),
+            _ =>                DVector::from_row_slice(&[ 0., 0., 1.]),
+            // _ => unreachable!(),
         }
+    }
+
+    pub fn format_stats_per_cluster(catch_per_cluster: &DVector<f64>, miss_per_cluster: &DVector<f64>, count_of_outputs: &DVector<f64>) {
+        
+        let total_items: f64 = catch_per_cluster.iter().chain(miss_per_cluster.iter()).copied().sum();
+        {
+            let real_items_count: f64 = count_of_outputs.iter().copied().sum();
+            let diff = total_items - real_items_count;
+            assert!(diff < std::f64::EPSILON && diff > -std::f64::EPSILON);
+        }
+        for cluster in 0..2 {
+            let cluster_name = match cluster {
+                // 0 => "neptune",
+                0 => "smurf",
+                1 => "normal",
+                _ => "BUG: Mixed cluster",
+            };
+            info!("Cluster {}", cluster_name);
+            let misses = miss_per_cluster[cluster];
+            let catches = catch_per_cluster[cluster];
+            let items = count_of_outputs[cluster];
+            info!("False negative: {}", 1. - dbg!(catches)/dbg!(items));
+            info!("False positive: {}", dbg!(misses)/dbg!(items));
+        }
+
+        let total_catches: f64 = catch_per_cluster.iter().copied().sum();
+
+        let total_misses: f64 = miss_per_cluster.iter().copied().sum();
+
+        info!("Total false negative: {}", 1. - total_catches/total_items);
+        info!("Total false positive: {}", total_misses/total_items);
+        
     }
 }
